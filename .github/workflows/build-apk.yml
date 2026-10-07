@@ -1,0 +1,78 @@
+name: Build Neon Player APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "debug = installs next to normal VLC | release = optimized, signed with a throw-away key"
+        type: choice
+        default: debug
+        options: [debug, release]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.3.1"
+
+      - name: Locate project (repo root, or neon-player-source.zip uploaded to the repo)
+        run: |
+          if [ -f settings.gradle ]; then
+            echo "PROJECT_DIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          else
+            unzip -q neon-player-source.zip -d "$RUNNER_TEMP/src"
+            DIR=$(dirname "$(find "$RUNNER_TEMP/src" -maxdepth 3 -name settings.gradle | head -1)")
+            mkdir -p "$GITHUB_WORKSPACE/neon-src"
+            cp -a "$DIR"/. "$GITHUB_WORKSPACE/neon-src/"
+            echo "PROJECT_DIR=$GITHUB_WORKSPACE/neon-src" >> "$GITHUB_ENV"
+          fi
+
+      - name: Prepare Android SDK / NDK and local.properties
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          NDK_DIR=$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1 || true)
+          if [ -z "$NDK_DIR" ]; then
+            sdkmanager "ndk;27.3.13750724"
+            NDK_DIR="$ANDROID_HOME/ndk/27.3.13750724"
+          fi
+          cd "$PROJECT_DIR"
+          # libvlcjni is a git submodule that is not part of the zip; prebuilt LibVLC comes from Maven.
+          mkdir -p libvlcjni/libvlc
+          {
+            echo "sdk.dir=$ANDROID_HOME"
+            echo "android.ndkPath=$NDK_DIR"
+            echo "android.ndkFullVersion=$(basename "$NDK_DIR")"
+          } > local.properties
+          cat local.properties
+
+      - name: Build (debug)
+        if: ${{ github.event.inputs.variant != 'release' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle :application:app:assembleDebug --stacktrace
+
+      - name: Build (release, throw-away signing key)
+        if: ${{ github.event.inputs.variant == 'release' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          keytool -genkeypair -keystore "$RUNNER_TEMP/neon.jks" -alias neon -keyalg RSA -keysize 2048 \
+            -validity 10000 -storepass neonplayer -keypass neonplayer -dname "CN=Neon Player"
+          gradle :application:app:assembleSignedRelease --stacktrace \
+            -PkeyStoreFile="$RUNNER_TEMP/neon.jks" -Pstorealias=neon -Pstorepwd=neonplayer
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NeonPlayer-APK
+          path: ${{ env.PROJECT_DIR }}/application/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
